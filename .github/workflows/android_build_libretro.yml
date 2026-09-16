@@ -1,0 +1,228 @@
+name: Android libretro Core Build Steps
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobName:
+        required: true
+        type: string
+      artifactPrefixName:
+        required: true
+        type: string
+      os:
+        required: false
+        type: string
+        default: ubuntu-latest # Mudamos para x86_64 padrão, pois faremos cross-compilation
+      platform:
+        required: false
+        type: string
+        default: android-arm64
+      fetchTags:
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  build_libretro_android:
+    name: ${{ inputs.jobName }}
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 90
+    env:
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_COMPRESS: true
+      CCACHE_COMPRESSLEVEL: 9
+      CCACHE_MAXSIZE: 100M
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive # Já puxa os submódulos do Git automaticamente
+
+      - name: Fetch Tags
+        if: ${{ inputs.fetchTags }}
+        run: git fetch --tags --no-recurse-submodules
+
+      - name: Prepare Artifact Metadata
+        id: artifact-metadata
+        shell: bash
+        env:
+          PREFIX: ${{ inputs.artifactPrefixName }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          PR_SHA: ${{ github.event.pull_request.head.sha }}
+        run: ./.github/workflows/scripts/common/name-artifacts.sh
+
+      - name: Prepare ccache timestamp
+        id: ccache_cache_timestamp
+        run: echo "timestamp=$(date -u "+%Y-%m-%d-%H;%M;%S")" >> $GITHUB_OUTPUT
+
+      - name: ccache cache files
+        uses: actions/cache@v3
+        with:
+          path: .ccache
+          key: ${{ inputs.os }} ${{ inputs.platform }} libretro ccache ${{ steps.ccache_cache_timestamp.outputs.timestamp }}
+          restore-keys: ${{ inputs.os }} ${{ inputs.platform }} libretro ccache
+
+      - name: Install System Packages
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install build-essential ccache cmake curl git ninja-build flex bison pkg-config wget unzip
+
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+
+      - name: Cache NDK Dependencies
+        id: cache-ndk-deps
+        uses: actions/cache@v3
+        with:
+          path: ${{ github.workspace }}/ndk-deps
+          key: ndk-deps-r27c-v1
+
+      - name: Build Android NDK Dependencies
+        if: steps.cache-ndk-deps.outputs.cache-hit != 'true'
+        run: |
+          export ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}
+          mkdir -p ${{ github.workspace }}/ndk-deps
+          
+          # Script de compilação de todas as dependências estáticas do Android
+          bash -c " \
+            mkdir -p deps && cd deps && \
+            \
+            echo '--- 1. libpng ---' && \
+            wget -q https://download.sourceforge.net/libpng/libpng-1.6.43.tar.gz && \
+            tar -xzf libpng-1.6.43.tar.gz && cd libpng-1.6.43 && mkdir build && cd build && \
+            cmake .. -DCMAKE_TOOLCHAIN_FILE=\$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/ndk-deps && make -j\$(nproc) install && cd ../.. && \
+            \
+            echo '--- 2. libjpeg-turbo ---' && \
+            wget -q https://github.com/libjpeg-turbo/libjpeg-turbo/archive/refs/tags/3.0.3.tar.gz -O libjpeg.tar.gz && \
+            tar -xzf libjpeg.tar.gz && cd libjpeg-turbo-3.0.3 && mkdir build && cd build && \
+            cmake .. -DCMAKE_TOOLCHAIN_FILE=\$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/ndk-deps -DENABLE_SHARED=OFF -DENABLE_STATIC=ON && make -j\$(nproc) install && cd ../.. && \
+            \
+            echo '--- 3. libzstd ---' && \
+            wget -q https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz && \
+            tar -xzf zstd-1.5.6.tar.gz && cd zstd-1.5.6/build/cmake && mkdir build && cd build && \
+            cmake .. -DCMAKE_TOOLCHAIN_FILE=\$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/ndk-deps -DZSTD_BUILD_SHARED=OFF -DZSTD_BUILD_STATIC=ON -DZSTD_BUILD_PROGRAMS=OFF && make -j\$(nproc) install && cd ../../../.. && \
+            \
+            echo '--- 4. liblz4 ---' && \
+            wget -q https://github.com/lz4/lz4/archive/refs/tags/v1.9.4.tar.gz -O lz4.tar.gz && \
+            tar -xzf lz4.tar.gz && cd lz4-1.9.4/build/cmake && mkdir build && cd build && \
+            cmake .. -DCMAKE_TOOLCHAIN_FILE=\$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/ndk-deps -DBUILD_SHARED_LIBS=OFF -DBUILD_STATIC_LIBS=ON -DLZ4_BUILD_CLI=OFF -DLZ4_BUILD_LEGACY_LZ4C=OFF && make -j\$(nproc) install && cd ../../../.. && \
+            \
+            echo '--- 5. libwebp ---' && \
+            wget -q https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.3.2.tar.gz && \
+            tar -xzf libwebp-1.3.2.tar.gz && cd libwebp-1.3.2 && mkdir build && cd build && \
+            cmake .. -DCMAKE_TOOLCHAIN_FILE=\$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/ndk-deps -DBUILD_SHARED_LIBS=OFF -DWEBP_BUILD_ANIM_UTILS=OFF -DWEBP_BUILD_CWEBP=OFF -DWEBP_BUILD_DWEBP=OFF -DWEBP_BUILD_GIF2WEBP=OFF -DWEBP_BUILD_IMG2WEBP=OFF -DWEBP_BUILD_VWEBP=OFF -DWEBP_BUILD_WEBPINFO=OFF -DWEBP_BUILD_WEBPMUX=OFF -DWEBP_BUILD_EXTRAS=OFF && make -j\$(nproc) install && cd ../.. && \
+            \
+            echo '--- 6. SDL3 ---' && \
+            git clone --depth 1 -b release-3.2.6 https://github.com/libsdl-org/SDL.git sdl3 && \
+            cd sdl3 && mkdir build && cd build && \
+            cmake .. -DCMAKE_TOOLCHAIN_FILE=\$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/ndk-deps -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TESTS=OFF && make -j\$(nproc) install && cd ../.. && \
+            \
+            echo '--- 7. libfreetype ---' && \
+            wget -q https://download.savannah.gnu.org/releases/freetype/freetype-2.13.2.tar.gz && \
+            tar -xzf freetype-2.13.2.tar.gz && cd freetype-2.13.2 && mkdir build && cd build && \
+            cmake .. -DCMAKE_TOOLCHAIN_FILE=\$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/ndk-deps -DBUILD_SHARED_LIBS=OFF -DCMAKE_DISABLE_FIND_PACKAGE_HarfBuzz=TRUE -DCMAKE_DISABLE_FIND_PACKAGE_BZip2=TRUE -DCMAKE_DISABLE_FIND_PACKAGE_BrotliDec=TRUE && make -j\$(nproc) install && cd ../.. && \
+            \
+            echo '--- 8. shaderc ---' && \
+            git clone https://github.com/google/shaderc.git && \
+            cd shaderc && ./utils/git-sync-deps && mkdir build && cd build && \
+            cmake .. -DCMAKE_TOOLCHAIN_FILE=\$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/ndk-deps -DSHADERC_SKIP_TESTS=ON -DSHADERC_SKIP_EXAMPLES=ON -DSHADERC_SKIP_COPYRIGHT_CHECK=ON -DBUILD_SHARED_LIBS=OFF && make -j\$(nproc) install && cd ../.. && \
+            \
+            echo '--- 9. libcurl ---' && \
+            git clone --depth 1 -b curl-8_7_1 https://github.com/curl/curl.git curl && \
+            cd curl && mkdir build && cd build && \
+            cmake .. -DCMAKE_TOOLCHAIN_FILE=\$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/ndk-deps -DBUILD_SHARED_LIBS=OFF -DCURL_USE_OPENSSL=OFF -DCURL_DISABLE_TESTS=ON && make -j\$(nproc) install && cd ../.. && \
+            \
+            echo '--- 10. libpcap ---' && \
+            git clone --depth 1 -b libpcap-1.10.4 https://github.com/the-tcpdump-group/libpcap.git libpcap && \
+            cd libpcap && mkdir build && cd build && \
+            cmake .. -DCMAKE_TOOLCHAIN_FILE=\$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/ndk-deps -DBUILD_SHARED_LIBS=OFF -DENABLE_BLUETOOTH=OFF -DENABLE_DBUS=OFF && make -j\$(nproc) install \
+          "
+
+      - name: Generate CMake
+        env:
+          DEPS: ${{ github.workspace }}/ndk-deps
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=${{ steps.setup-ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DENABLE_QT_UI=OFF \
+            -DENABLE_SDL_FRONTEND=OFF \
+            -DENABLE_LIBRETRO=ON \
+            -DENABLE_GSRUNNER=OFF \
+            -DENABLE_TESTS=OFF \
+            -DENABLE_RECOMPILER_TEST_HOOKS=OFF \
+            -DENABLE_SETCAP=OFF \
+            -DUSE_BACKTRACE=OFF \
+            -DX11_API=OFF \
+            -DWAYLAND_API=OFF \
+            -DDISABLE_ADVANCE_SIMD=TRUE \
+            -DOVERRIDE_HOST_PAGE_SIZE=4096 \
+            -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON \
+            -DCMAKE_CXX_STANDARD=20 \
+            -DCMAKE_C_FLAGS="-march=armv8-a+crypto" \
+            -DCMAKE_CXX_FLAGS="-march=armv8-a+crypto" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld" \
+            -DCMAKE_FIND_ROOT_PATH="$DEPS" \
+            -DCMAKE_PREFIX_PATH="$DEPS" \
+            -DPNG_PNG_INCLUDE_DIR="$DEPS/include" \
+            -DPNG_LIBRARY="$DEPS/lib/libpng.a" \
+            -DJPEG_INCLUDE_DIR="$DEPS/include" \
+            -DJPEG_LIBRARY="$DEPS/lib/libjpeg.a" \
+            -DZSTD_INCLUDE_DIR="$DEPS/include" \
+            -DZSTD_LIBRARY="$DEPS/lib/libzstd.a" \
+            -DZstd_INCLUDE_DIR="$DEPS/include" \
+            -DZstd_LIBRARY="$DEPS/lib/libzstd.a" \
+            -DLZ4_INCLUDE_DIR="$DEPS/include" \
+            -DLZ4_LIBRARY="$DEPS/lib/liblz4.a" \
+            -DWebP_INCLUDE_DIR="$DEPS/include" \
+            -DWebP_LIBRARY="$DEPS/lib/libwebp.a" \
+            -DFREETYPE_INCLUDE_DIRS="$DEPS/include/freetype2" \
+            -DFREETYPE_LIBRARY="$DEPS/lib/libfreetype.a" \
+            -DSHADERC_INCLUDE_DIR="$DEPS/include" \
+            -DSHADERC_LIBRARY="$DEPS/lib/libshaderc_combined.a" \
+            -DCURL_INCLUDE_DIR="$DEPS/include" \
+            -DCURL_LIBRARY="$DEPS/lib/libcurl.a" \
+            -DPCAP_INCLUDE_DIR="$DEPS/include" \
+            -DPCAP_LIBRARY="$DEPS/lib/libpcap.a"
+
+      - name: Build armsx2_libretro
+        working-directory: build
+        run: |
+          ccache -p
+          ccache -z
+          ninja pcsx2-libretro
+          ccache -s
+
+      - name: Package libretro Core Tarball
+        env:
+          NAME: ${{ steps.artifact-metadata.outputs.artifact-name }}
+        run: |
+          SO=$(find build -name 'armsx2_libretro.so' | head -1)
+          test -n "$SO" || { echo "armsx2_libretro.so not found"; exit 1; }
+          # Usa o strip nativo do NDK para a arquitetura correta
+          ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip --strip-unneeded "$SO"
+          mkdir -p "pkg/${NAME}"
+          cp -v "$SO" "pkg/${NAME}/"
+          tar --zstd -C pkg -cf "${NAME}.tar.zst" "${NAME}"
+          mkdir -p "$GITHUB_WORKSPACE"/ci-artifacts/
+          mv "${NAME}.tar.zst" "$GITHUB_WORKSPACE"/ci-artifacts/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact-metadata.outputs.artifact-name }}
+          path: ci-artifacts
